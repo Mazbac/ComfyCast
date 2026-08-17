@@ -5,9 +5,8 @@ import asyncio
 from typing_extensions import override
 from comfy_api.latest import ComfyExtension, Input, Types, io
 
-from .comfycast.cast_service import cast_media
+from .comfycast.cast_service import cast_file
 from .comfycast.media import save_image_tensor, save_video_input
-from .comfycast.media_server import MEDIA_SERVER
 
 
 class CastImage(io.ComfyNode):
@@ -45,14 +44,12 @@ class CastImage(io.ComfyNode):
             image,
             image_index,
         )
-        media_url = MEDIA_SERVER.publish(path, content_type)
         await asyncio.to_thread(
-            cast_media,
+            cast_file,
             device,
-            media_url,
+            path,
             content_type,
             title=title,
-            autoplay=True,
         )
         return io.NodeOutput(image)
 
@@ -64,7 +61,10 @@ class CastVideo(io.ComfyNode):
             node_id="ComfyCastVideo",
             display_name="Cast Video",
             category="ComfyCast",
-            description="Cast a native ComfyUI video directly to a Google Cast / Chromecast display.",
+            description=(
+                "Cast a native ComfyUI video directly to a Google Cast / "
+                "Chromecast display."
+            ),
             inputs=[
                 io.Video.Input("video", tooltip="Native ComfyUI VIDEO input."),
                 io.String.Input(
@@ -74,6 +74,11 @@ class CastVideo(io.ComfyNode):
                 ),
                 io.String.Input("title", default="ComfyCast Video"),
                 io.Boolean.Input("autoplay", default=True),
+                io.Boolean.Input(
+                    "loop",
+                    default=False,
+                    tooltip="Repeat the video continuously on the Cast receiver.",
+                ),
             ],
             is_output_node=True,
             outputs=[io.Video.Output("video")],
@@ -86,6 +91,7 @@ class CastVideo(io.ComfyNode):
         device: str,
         title: str,
         autoplay: bool,
+        loop: bool,
     ) -> io.NodeOutput:
         path, content_type = await asyncio.to_thread(
             save_video_input,
@@ -93,14 +99,14 @@ class CastVideo(io.ComfyNode):
             Types.VideoContainer.MP4,
             Types.VideoCodec.H264,
         )
-        media_url = MEDIA_SERVER.publish(path, content_type)
         await asyncio.to_thread(
-            cast_media,
+            cast_file,
             device,
-            media_url,
+            path,
             content_type,
             title=title,
             autoplay=autoplay,
+            loop=loop,
         )
         return io.NodeOutput(video)
 

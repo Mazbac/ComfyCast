@@ -14,7 +14,7 @@ class MediaServerTests(unittest.TestCase):
         self.path = Path(handle.name)
         self.server = media_server.LocalMediaServer()
         self.original_get_lan_ip = media_server.get_lan_ip
-        media_server.get_lan_ip = lambda: "127.0.0.1"
+        media_server.get_lan_ip = lambda _target=None: "127.0.0.1"
 
     def tearDown(self):
         self.server.stop()
