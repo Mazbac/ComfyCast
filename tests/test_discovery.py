@@ -71,6 +71,14 @@ class DiscoveryCacheTests(unittest.TestCase):
         self.assertEqual(second, self.device)
         self.assertEqual(discover.call_count, 1)
 
+    @patch("comfycast.discovery.discover_video_devices")
+    def test_friendly_label_resolves_after_scan(self, discover):
+        discover.return_value = [self.device]
+        service = DiscoveryService(ttl_seconds=60)
+        resolved = service.resolve(self.device.label)
+        self.assertEqual(resolved, self.device)
+        self.assertEqual(discover.call_count, 1)
+
 
 if __name__ == "__main__":
     unittest.main()

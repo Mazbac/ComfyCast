@@ -16,8 +16,18 @@ class CastDevice:
     uuid: str
     cast_type: str
 
+    @property
+    def label(self) -> str:
+        parts = [self.name]
+        if self.model and self.model != "Unknown":
+            parts.append(self.model)
+        parts.append(self.host)
+        return " - ".join(parts)
+
     def to_dict(self) -> dict[str, str | int]:
-        return asdict(self)
+        data = asdict(self)
+        data["label"] = self.label
+        return data
 
 
 class DiscoveryError(RuntimeError):
@@ -104,13 +114,13 @@ class DiscoveryService:
     def _build_index(devices: tuple[CastDevice, ...]) -> dict[str, CastDevice]:
         index: dict[str, CastDevice] = {}
         for device in devices:
-            for key in (device.uuid, device.host, device.name):
+            for key in (device.uuid, device.host, device.name, device.label):
                 index.setdefault(key.casefold(), device)
         return index
 
     def _remember(self, device: CastDevice) -> None:
         with self._state_lock:
-            for key in (device.uuid, device.host, device.name):
+            for key in (device.uuid, device.host, device.name, device.label):
                 self._index[key.casefold()] = device
 
     def _cached(self, value: str) -> CastDevice | None:
