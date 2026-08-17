@@ -11,7 +11,7 @@ from urllib.parse import quote, urlparse
 from .network import get_lan_ip
 
 
-@dataclass
+@dataclass(frozen=True, slots=True)
 class MediaEntry:
     path: Path
     content_type: str
@@ -28,7 +28,11 @@ class MediaRegistry:
         token = secrets.token_urlsafe(24)
         with self._lock:
             self._cleanup_locked()
-            self._entries[token] = MediaEntry(resolved, content_type, time.time() + ttl_seconds)
+            self._entries[token] = MediaEntry(
+                resolved,
+                content_type,
+                time.monotonic() + ttl_seconds,
+            )
         return token
 
     def get(self, token: str) -> MediaEntry | None:
@@ -40,8 +44,12 @@ class MediaRegistry:
             return entry
 
     def _cleanup_locked(self) -> None:
-        now = time.time()
-        expired = [token for token, entry in self._entries.items() if entry.expires_at <= now]
+        now = time.monotonic()
+        expired = [
+            token
+            for token, entry in self._entries.items()
+            if entry.expires_at <= now
+        ]
         for token in expired:
             self._entries.pop(token, None)
 
@@ -49,6 +57,8 @@ class MediaRegistry:
 def _parse_range(value: str, size: int) -> tuple[int, int] | None:
     if not value or not value.startswith("bytes="):
         return None
+    if size <= 0:
+        raise ValueError("Unsatisfiable byte range")
     spec = value[6:].strip()
     if not spec or "," in spec or "-" not in spec:
         raise ValueError("Unsupported byte range")
@@ -74,6 +84,18 @@ class LocalMediaServer:
         self._server: ThreadingHTTPServer | None = None
         self._thread: threading.Thread | None = None
 
+    @property
+    def is_running(self) -> bool:
+        with self._lock:
+            return self._server is not None
+
+    @property
+    def current_port(self) -> int | None:
+        with self._lock:
+            if self._server is None:
+                return None
+            return int(self._server.server_address[1])
+
     def ensure_started(self) -> None:
         with self._lock:
             if self._server is not None:
@@ -82,6 +104,7 @@ class LocalMediaServer:
 
             class Handler(BaseHTTPRequestHandler):
                 server_version = "ComfyCast/1.0"
+                protocol_version = "HTTP/1.1"
 
                 def do_GET(self):
                     self._serve(send_body=True)
@@ -94,19 +117,28 @@ class LocalMediaServer:
 
                 def _serve(self, send_body: bool):
                     parts = urlparse(self.path).path.strip("/").split("/")
-                    if len(parts) < 3 or parts[0] != "media":
+                    if len(parts) != 3 or parts[0] != "media":
                         self.send_error(404)
                         return
                     entry = registry.get(parts[1])
                     if entry is None:
                         self.send_error(404)
                         return
-                    size = entry.path.stat().st_size
                     try:
-                        byte_range = _parse_range(self.headers.get("Range", ""), size)
+                        size = entry.path.stat().st_size
+                    except OSError:
+                        self.send_error(404)
+                        return
+
+                    try:
+                        byte_range = _parse_range(
+                            self.headers.get("Range", ""),
+                            size,
+                        )
                     except (ValueError, TypeError):
                         self.send_response(416)
                         self.send_header("Content-Range", f"bytes */{size}")
+                        self.send_header("Content-Length", "0")
                         self.end_headers()
                         return
 
@@ -118,20 +150,32 @@ class LocalMediaServer:
                     self.send_header("Accept-Ranges", "bytes")
                     self.send_header("Cache-Control", "no-store")
                     if byte_range:
-                        self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
+                        self.send_header(
+                            "Content-Range",
+                            f"bytes {start}-{end}/{size}",
+                        )
                     self.end_headers()
                     if not send_body or length == 0:
                         return
 
-                    with entry.path.open("rb") as source:
-                        source.seek(start)
-                        remaining = length
-                        while remaining > 0:
-                            chunk = source.read(min(256 * 1024, remaining))
-                            if not chunk:
-                                break
-                            self.wfile.write(chunk)
-                            remaining -= len(chunk)
+                    try:
+                        with entry.path.open("rb") as source:
+                            source.seek(start)
+                            remaining = length
+                            while remaining > 0:
+                                chunk = source.read(min(256 * 1024, remaining))
+                                if not chunk:
+                                    break
+                                self.wfile.write(chunk)
+                                remaining -= len(chunk)
+                    except (
+                        BrokenPipeError,
+                        ConnectionAbortedError,
+                        ConnectionResetError,
+                    ):
+                        # Receivers may close a range request as soon as they
+                        # have buffered enough data. That is not a server error.
+                        return
 
             self._server = ThreadingHTTPServer(("0.0.0.0", 0), Handler)
             self._server.daemon_threads = True
@@ -145,15 +189,24 @@ class LocalMediaServer:
     @property
     def port(self) -> int:
         self.ensure_started()
-        assert self._server is not None
-        return int(self._server.server_address[1])
+        port = self.current_port
+        assert port is not None
+        return port
 
-    def publish(self, path: str | Path, content_type: str, ttl_seconds: float = 3600.0) -> str:
+    def publish(
+        self,
+        path: str | Path,
+        content_type: str,
+        ttl_seconds: float = 3600.0,
+        *,
+        target_host: str | None = None,
+    ) -> str:
         self.ensure_started()
         resolved = Path(path).resolve(strict=True)
         token = self.registry.register(resolved, content_type, ttl_seconds)
-        filename = quote(resolved.name)
-        return f"http://{get_lan_ip()}:{self.port}/media/{token}/{filename}"
+        filename = quote(resolved.name, safe="")
+        host = get_lan_ip(target_host)
+        return f"http://{host}:{self.port}/media/{token}/{filename}"
 
     def stop(self) -> None:
         with self._lock:

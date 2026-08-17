@@ -1,28 +1,81 @@
 from __future__ import annotations
 
+from pathlib import Path
 import time
+from uuid import UUID
 
-from .discovery import DISCOVERY, DiscoveryError, _load_pychromecast
+from .discovery import CastDevice, DISCOVERY, DiscoveryError, _load_pychromecast
+from .media_server import MEDIA_SERVER
+
+
+DEFAULT_MEDIA_TTL_SECONDS = 60 * 60
+LOOP_MEDIA_TTL_SECONDS = 24 * 60 * 60
 
 
 class CastError(RuntimeError):
     pass
 
 
+def _build_load_message(
+    media_url: str,
+    content_type: str,
+    *,
+    title: str | None,
+    autoplay: bool,
+    loop: bool,
+) -> dict:
+    media = {
+        "contentId": media_url,
+        "streamType": "BUFFERED",
+        "contentType": content_type,
+        "metadata": {
+            "metadataType": 0,
+            "title": title or "ComfyCast",
+        },
+    }
+    message = {
+        "type": "LOAD",
+        "media": media,
+        "autoplay": autoplay,
+        "customData": {},
+    }
+    if loop:
+        message["queueData"] = {
+            "repeatMode": "REPEAT_SINGLE",
+            "items": [
+                {
+                    "media": media,
+                    "autoplay": True,
+                    "startTime": 0,
+                    "preloadTime": 0,
+                }
+            ],
+            "startIndex": 0,
+            "startTime": 0,
+        }
+    return message
+
+
 def _wait_for_media(cast, media_url: str, timeout: float = 10.0) -> str:
     controller = cast.media_controller
     deadline = time.monotonic() + timeout
+    next_refresh = 0.0
     accepted_states = {"PLAYING", "PAUSED", "BUFFERING"}
 
-    while time.monotonic() < deadline:
+    while True:
         status = controller.status
         if status.content_id == media_url and status.player_state in accepted_states:
             return status.player_state
-        try:
-            controller.update_status()
-        except Exception:
-            pass
-        time.sleep(0.25)
+        now = time.monotonic()
+        if now >= deadline:
+            break
+        if now >= next_refresh:
+            try:
+                controller.update_status()
+            except Exception:
+                pass
+            next_refresh = now + 0.5
+        time.sleep(min(0.1, max(0.0, deadline - now)))
 
     status = controller.status
     raise CastError(
@@ -31,49 +84,75 @@ def _wait_for_media(cast, media_url: str, timeout: float = 10.0) -> str:
     )
 
 
-def cast_media(
-    device_identifier: str,
+def _connect_direct(pychromecast, device: CastDevice):
+    return pychromecast.get_chromecast_from_host(
+        (
+            device.host,
+            device.port,
+            UUID(device.uuid),
+            device.model,
+            device.name,
+        ),
+        tries=2,
+        retry_wait=0.25,
+        timeout=5,
+    )
+
+
+def _send_load(
+    cast,
     media_url: str,
     content_type: str,
     *,
-    title: str | None = None,
-    autoplay: bool = True,
+    title: str | None,
+    autoplay: bool,
+    loop: bool,
+    timeout: float = 15.0,
+) -> None:
+    from pychromecast.quick_play import DefaultMediaReceiverController
+    from pychromecast.response_handler import WaitResponse
+
+    controller = DefaultMediaReceiverController()
+    cast.register_handler(controller)
+    try:
+        response = WaitResponse(timeout, f"load {media_url}")
+        controller.send_message(
+            _build_load_message(
+                media_url,
+                content_type,
+                title=title,
+                autoplay=autoplay,
+                loop=loop,
+            ),
+            inc_session_id=True,
+            callback_function=response.callback,
+        )
+        response.wait_response()
+    finally:
+        cast.unregister_handler(controller)
+
+
+def _cast_url(
+    device: CastDevice,
+    media_url: str,
+    content_type: str,
+    *,
+    title: str | None,
+    autoplay: bool,
+    loop: bool,
 ) -> dict[str, str]:
     pychromecast = _load_pychromecast()
-    try:
-        device = DISCOVERY.resolve(device_identifier)
-    except DiscoveryError as exc:
-        raise CastError(str(exc)) from exc
-
-    browser = None
     cast = None
     try:
-        casts, browser = pychromecast.get_chromecasts(
-            timeout=5,
-            known_hosts=[device.host],
-        )
-        for candidate in casts:
-            info = candidate.cast_info
-            if str(candidate.uuid) == device.uuid or info.host == device.host:
-                cast = candidate
-                break
-        if cast is None:
-            raise CastError(f"Could not connect to Cast device: {device.name}")
-
-        cast.wait(timeout=10)
-        from pychromecast.quick_play import quick_play
-
-        quick_play(
+        cast = _connect_direct(pychromecast, device)
+        cast.wait(timeout=8)
+        _send_load(
             cast,
-            "default_media_receiver",
-            {
-                "media_id": media_url,
-                "media_type": content_type,
-                "title": title or "ComfyCast",
-                "autoplay": autoplay,
-                "stream_type": "BUFFERED",
-            },
-            timeout=15,
+            media_url,
+            content_type,
+            title=title,
+            autoplay=autoplay,
+            loop=loop,
         )
         player_state = _wait_for_media(cast, media_url, timeout=10)
         return {
@@ -88,13 +167,43 @@ def cast_media(
     except Exception as exc:
         raise CastError(f"Casting to {device.name} failed: {exc}") from exc
     finally:
-        if browser is not None:
-            try:
-                pychromecast.discovery.stop_discovery(browser)
-            except Exception:
-                pass
         if cast is not None:
             try:
-                cast.disconnect(timeout=2)
+                cast.disconnect(timeout=1)
             except Exception:
                 pass
+
+
+def cast_file(
+    device_identifier: str,
+    path: str | Path,
+    content_type: str,
+    *,
+    title: str | None = None,
+    autoplay: bool = True,
+    loop: bool = False,
+) -> dict[str, str]:
+    """Publish a local media file and cast it to the selected device."""
+    try:
+        device = DISCOVERY.resolve(device_identifier)
+    except DiscoveryError as exc:
+        raise CastError(str(exc)) from exc
+
+    try:
+        media_url = MEDIA_SERVER.publish(
+            path,
+            content_type,
+            ttl_seconds=LOOP_MEDIA_TTL_SECONDS if loop else DEFAULT_MEDIA_TTL_SECONDS,
+            target_host=device.host,
+        )
+    except Exception as exc:
+        raise CastError(f"Could not prepare media for {device.name}: {exc}") from exc
+
+    return _cast_url(
+        device,
+        media_url,
+        content_type,
+        title=title,
+        autoplay=autoplay,
+        loop=loop,
+    )

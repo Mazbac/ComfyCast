@@ -5,7 +5,7 @@ ComfyCast adds Google Cast / Chromecast output nodes to ComfyUI so a finished im
 ## What it does
 
 - `Cast Image` accepts a native ComfyUI `IMAGE`.
-- `Cast Video` accepts a native ComfyUI `VIDEO`.
+- `Cast Video` accepts a native ComfyUI `VIDEO` and can loop it continuously on the receiver.
 - Discovers video-capable Google Cast devices on the local network.
 - Adds a dynamic Cast-device picker to the nodes.
 - Serves generated media from a private temporary LAN URL.
@@ -72,8 +72,9 @@ Connect a native ComfyUI `VIDEO` output to **ComfyCast -> Cast Video**.
 - **Cast device** - discovered TV/display.
 - **title** - media title sent to the receiver.
 - **autoplay** - whether playback starts automatically.
+- **loop** - repeat the video continuously using the Cast receiver's native repeat mode.
 
-Video is materialized through ComfyUI's native video API as MP4/H.264 for broad Cast compatibility.
+Video is materialized through ComfyUI's native video API as MP4/H.264 for broad Cast compatibility. Looping uses the receiver's native single-item repeat queue, so ComfyUI does not need to stay connected to restart the video.
 
 ## Network behavior
 

@@ -7,15 +7,16 @@ import threading
 import time
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class CastDevice:
     name: str
     host: str
+    port: int
     model: str
     uuid: str
     cast_type: str
 
-    def to_dict(self) -> dict[str, str]:
+    def to_dict(self) -> dict[str, str | int]:
         return asdict(self)
 
 
@@ -28,7 +29,8 @@ def _load_pychromecast():
         import pychromecast
     except ImportError as exc:
         raise DiscoveryError(
-            "PyChromecast is not installed. Install ComfyCast requirements and restart ComfyUI."
+            "PyChromecast is not installed. Install ComfyCast requirements "
+            "and restart ComfyUI."
         ) from exc
     return pychromecast
 
@@ -73,6 +75,7 @@ def discover_video_devices(
                 CastDevice(
                     name=cast.name or info.friendly_name or str(cast.uuid),
                     host=info.host,
+                    port=int(info.port or 8009),
                     model=cast.model_name or info.model_name or "Unknown",
                     uuid=str(cast.uuid),
                     cast_type=cast.cast_type or "cast",
@@ -91,57 +94,86 @@ def discover_video_devices(
 class DiscoveryService:
     def __init__(self, ttl_seconds: float = 15.0):
         self._ttl = ttl_seconds
-        self._lock = threading.Lock()
-        self._devices: list[CastDevice] = []
+        self._state_lock = threading.Lock()
+        self._refresh_lock = threading.Lock()
+        self._devices: tuple[CastDevice, ...] = ()
+        self._index: dict[str, CastDevice] = {}
         self._updated_at = 0.0
 
-    def list_devices(self, force: bool = False) -> list[CastDevice]:
-        with self._lock:
-            stale = time.monotonic() - self._updated_at >= self._ttl
-            if force or stale or not self._devices:
-                self._devices = discover_video_devices()
-                self._updated_at = time.monotonic()
-            return list(self._devices)
-
     @staticmethod
-    def _find(devices: list[CastDevice], value: str) -> CastDevice | None:
+    def _build_index(devices: tuple[CastDevice, ...]) -> dict[str, CastDevice]:
+        index: dict[str, CastDevice] = {}
         for device in devices:
-            if value in {
-                device.name.casefold(),
-                device.host.casefold(),
-                device.uuid.casefold(),
-            }:
-                return device
-        return None
+            for key in (device.uuid, device.host, device.name):
+                index.setdefault(key.casefold(), device)
+        return index
+
+    def _remember(self, device: CastDevice) -> None:
+        with self._state_lock:
+            for key in (device.uuid, device.host, device.name):
+                self._index[key.casefold()] = device
+
+    def _cached(self, value: str) -> CastDevice | None:
+        with self._state_lock:
+            return self._index.get(value.casefold())
+
+    def _snapshot(self) -> tuple[tuple[CastDevice, ...], float]:
+        with self._state_lock:
+            return self._devices, self._updated_at
+
+    def list_devices(self, force: bool = False) -> list[CastDevice]:
+        requested_at = time.monotonic()
+        devices, updated_at = self._snapshot()
+        fresh = bool(devices) and requested_at - updated_at < self._ttl
+        if fresh and not force:
+            return list(devices)
+
+        # Only one network scan may run at a time. A second force-refresh that
+        # was already waiting reuses the scan that completed while it waited.
+        with self._refresh_lock:
+            devices, updated_at = self._snapshot()
+            if updated_at >= requested_at:
+                return list(devices)
+            if devices and not force and time.monotonic() - updated_at < self._ttl:
+                return list(devices)
+
+            refreshed = tuple(discover_video_devices())
+            with self._state_lock:
+                self._devices = refreshed
+                self._index = self._build_index(refreshed)
+                self._updated_at = time.monotonic()
+            return list(refreshed)
 
     def resolve(self, identifier: str) -> CastDevice:
-        value = identifier.strip().casefold()
-        if not value:
+        raw = identifier.strip()
+        if not raw:
             raise DiscoveryError("No Chromecast device selected.")
 
-        with self._lock:
-            cached = list(self._devices)
-        match = self._find(cached, value)
+        match = self._cached(raw)
         if match is not None:
             return match
 
-        devices = self.list_devices(force=True)
-        match = self._find(devices, value)
-        if match is not None:
-            return match
-
+        # An explicit IP can be resolved without waiting for a full mDNS scan.
         try:
-            ipaddress.ip_address(identifier.strip())
+            ipaddress.ip_address(raw)
         except ValueError:
             pass
         else:
-            direct = discover_video_devices(
-                timeout=5.0,
-                known_hosts=[identifier.strip()],
-            )
-            match = self._find(direct, value)
-            if match is not None:
-                return match
+            direct = discover_video_devices(timeout=5.0, known_hosts=[raw])
+            for device in direct:
+                if raw.casefold() in {
+                    device.host.casefold(),
+                    device.uuid.casefold(),
+                    device.name.casefold(),
+                }:
+                    self._remember(device)
+                    return device
+            raise DiscoveryError(f"Cast device not found: {identifier}")
+
+        self.list_devices(force=True)
+        match = self._cached(raw)
+        if match is not None:
+            return match
 
         raise DiscoveryError(f"Cast device not found: {identifier}")
 
