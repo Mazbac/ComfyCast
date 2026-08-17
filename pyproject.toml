@@ -1,0 +1,22 @@
+[project]
+name = "comfycast"
+version = "0.1.0"
+description = "Cast ComfyUI image and video outputs directly to Google Cast / Chromecast displays."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { file = "LICENSE" }
+dependencies = [
+    "PyChromecast==14.0.10",
+]
+classifiers = [
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+]
+
+[project.urls]
+Repository = "https://github.com/Mazbac/ComfyCast"
+Issues = "https://github.com/Mazbac/ComfyCast/issues"
+
+[tool.comfy]
+PublisherId = "Mazbac"
+DisplayName = "ComfyCast"
