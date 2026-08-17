@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import logging
 import time
 from uuid import UUID
 
@@ -10,6 +11,7 @@ from .media_server import MEDIA_SERVER
 
 DEFAULT_MEDIA_TTL_SECONDS = 60 * 60
 LOOP_MEDIA_TTL_SECONDS = 24 * 60 * 60
+LOGGER = logging.getLogger(__name__)
 
 
 class CastError(RuntimeError):
@@ -79,8 +81,10 @@ def _wait_for_media(cast, media_url: str, timeout: float = 10.0) -> str:
 
     status = controller.status
     raise CastError(
-        "Receiver did not confirm the ComfyCast media URL "
-        f"(state={status.player_state}, content={status.content_id!r})."
+        "Receiver did not start ComfyCast media "
+        f"(state={status.player_state}, idle_reason={status.idle_reason!r}, "
+        f"session={status.media_session_id!r}, duration={status.duration!r}, "
+        f"content={status.content_id!r})."
     )
 
 
@@ -132,6 +136,51 @@ def _send_load(
         cast.unregister_handler(controller)
 
 
+def _load_with_retry(
+    cast,
+    media_url: str,
+    content_type: str,
+    *,
+    title: str | None,
+    autoplay: bool,
+    loop: bool,
+) -> str:
+    last_error: Exception | None = None
+    for attempt, wait_timeout in enumerate((10.0, 15.0), start=1):
+        try:
+            _send_load(
+                cast,
+                media_url,
+                content_type,
+                title=title,
+                autoplay=autoplay,
+                loop=loop,
+            )
+            return _wait_for_media(cast, media_url, timeout=wait_timeout)
+        except Exception as exc:
+            last_error = exc
+            if attempt == 2:
+                raise
+            status = cast.media_controller.status
+            LOGGER.warning(
+                "Cast load did not become active; retrying once "
+                "(state=%s, idle_reason=%r, session=%r, content=%r): %s",
+                status.player_state,
+                status.idle_reason,
+                status.media_session_id,
+                status.content_id,
+                exc,
+            )
+            try:
+                cast.media_controller.update_status()
+            except Exception:
+                pass
+            time.sleep(0.75)
+
+    assert last_error is not None
+    raise last_error
+
+
 def _cast_url(
     device: CastDevice,
     media_url: str,
@@ -146,7 +195,7 @@ def _cast_url(
     try:
         cast = _connect_direct(pychromecast, device)
         cast.wait(timeout=8)
-        _send_load(
+        player_state = _load_with_retry(
             cast,
             media_url,
             content_type,
@@ -154,7 +203,6 @@ def _cast_url(
             autoplay=autoplay,
             loop=loop,
         )
-        player_state = _wait_for_media(cast, media_url, timeout=10)
         return {
             "name": device.name,
             "host": device.host,

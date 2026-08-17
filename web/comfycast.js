@@ -16,8 +16,9 @@ async function fetchDevices(force = false) {
 }
 
 function describeDevice(device) {
-    const model = device.model ? ` — ${device.model}` : "";
-    return `${device.name}${model} — ${device.host}`;
+    if (device.label) return device.label;
+    const model = device.model ? ` - ${device.model}` : "";
+    return `${device.name}${model} - ${device.host}`;
 }
 
 function installDevicePicker(node) {
@@ -25,15 +26,11 @@ function installDevicePicker(node) {
     if (!deviceWidget || deviceWidget._comfycastInstalled) return;
     deviceWidget._comfycastInstalled = true;
 
-    const labels = new Map();
-    const labelFor = (value) => labels.get(value) || value || "";
-
     deviceWidget.type = "combo";
     deviceWidget.label = "Cast device";
     deviceWidget.options = {
         ...(deviceWidget.options || {}),
         values: [],
-        getOptionLabel: labelFor,
     };
 
     const status = node.addWidget(
@@ -50,25 +47,20 @@ function installDevicePicker(node) {
         status.value = force ? "Refreshing devices…" : "Discovering devices…";
         try {
             const devices = await fetchDevices(force);
-            labels.clear();
-            const ids = devices.map((device) => {
-                labels.set(device.uuid, describeDevice(device));
-                return device.uuid;
-            });
+            const choices = devices.map(describeDevice);
 
             deviceWidget.options = {
                 ...(deviceWidget.options || {}),
-                values: ids,
-                getOptionLabel: labelFor,
+                values: choices,
             };
 
             const current = String(deviceWidget.value || "").toLowerCase();
             const match = devices.find((device) =>
-                [device.uuid, device.name, device.host].some(
+                [device.uuid, device.name, device.host, describeDevice(device)].some(
                     (value) => String(value).toLowerCase() === current,
                 ),
             );
-            deviceWidget.value = match?.uuid || ids[0] || "";
+            deviceWidget.value = match ? describeDevice(match) : choices[0] || "";
             status.value = devices.length
                 ? `${devices.length} display${devices.length === 1 ? "" : "s"} found`
                 : "No video-capable Cast devices found";
@@ -76,7 +68,6 @@ function installDevicePicker(node) {
             deviceWidget.options = {
                 ...(deviceWidget.options || {}),
                 values: [],
-                getOptionLabel: labelFor,
             };
             status.value = `Discovery error: ${error.message || error}`;
         }
