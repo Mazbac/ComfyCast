@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from pathlib import Path
 import logging
+import threading
 import time
 from uuid import UUID
 
@@ -12,6 +14,31 @@ from .media_server import MEDIA_SERVER
 DEFAULT_MEDIA_TTL_SECONDS = 60 * 60
 LOOP_MEDIA_TTL_SECONDS = 24 * 60 * 60
 LOGGER = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True, slots=True)
+class PlaybackRecord:
+    media_url: str
+    content_type: str
+    title: str | None
+    loop: bool
+
+
+class PlaybackRegistry:
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._records: dict[str, PlaybackRecord] = {}
+
+    def remember(self, device: CastDevice, record: PlaybackRecord) -> None:
+        with self._lock:
+            self._records[device.uuid] = record
+
+    def get(self, device: CastDevice) -> PlaybackRecord | None:
+        with self._lock:
+            return self._records.get(device.uuid)
+
+
+PLAYBACK = PlaybackRegistry()
 
 
 class CastError(RuntimeError):
@@ -222,6 +249,104 @@ def _cast_url(
                 pass
 
 
+def _wait_for_states(controller, states: set[str], timeout: float = 6.0) -> str:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        status = controller.status
+        if status.player_state in states:
+            return status.player_state
+        try:
+            controller.update_status()
+        except Exception:
+            pass
+        time.sleep(0.15)
+    return controller.status.player_state
+
+
+def _control_connected(cast, record: PlaybackRecord, action: str) -> dict[str, str]:
+    from pychromecast.config import APP_MEDIA_RECEIVER
+
+    controller = cast.media_controller
+    if action != "end":
+        try:
+            controller.update_status()
+            controller.block_until_active(timeout=2.5)
+        except Exception:
+            pass
+    status = controller.status
+    same_media = status.content_id == record.media_url
+
+    if action == "start":
+        if same_media and status.player_state == "PAUSED" and record.content_type.startswith("video/"):
+            controller.play()
+            state = _wait_for_states(controller, {"PLAYING", "BUFFERING"})
+        elif same_media and status.player_state in {"PLAYING", "BUFFERING", "PAUSED"}:
+            state = status.player_state
+        else:
+            state = _load_with_retry(
+                cast,
+                record.media_url,
+                record.content_type,
+                title=record.title,
+                autoplay=True,
+                loop=record.loop,
+            )
+    elif action == "pause":
+        if not same_media:
+            raise CastError("No active ComfyCast media to pause on the selected device.")
+        if record.content_type.startswith("image/"):
+            state = status.player_state or "PAUSED"
+        else:
+            controller.pause()
+            state = _wait_for_states(controller, {"PAUSED"})
+    elif action == "stop":
+        if same_media:
+            controller.stop()
+            state = _wait_for_states(controller, {"IDLE"})
+        else:
+            state = "IDLE"
+    elif action == "end":
+        if cast.app_id == APP_MEDIA_RECEIVER:
+            cast.quit_app(timeout=10)
+        state = "ENDED"
+    else:
+        raise CastError(f"Unsupported Cast control action: {action}")
+
+    return {"action": action, "player_state": state}
+
+
+def control_cast(device_identifier: str, action: str) -> dict[str, str]:
+    try:
+        device = DISCOVERY.resolve(device_identifier)
+    except DiscoveryError as exc:
+        raise CastError(str(exc)) from exc
+
+    record = PLAYBACK.get(device)
+    if record is None:
+        raise CastError(
+            "No previous ComfyCast media is available for this device. "
+            "Run the Cast Image or Cast Video node once first."
+        )
+
+    pychromecast = _load_pychromecast()
+    cast = None
+    try:
+        cast = _connect_direct(pychromecast, device)
+        cast.wait(timeout=8)
+        result = _control_connected(cast, record, action)
+        result.update({"name": device.name, "uuid": device.uuid})
+        return result
+    except CastError:
+        raise
+    except Exception as exc:
+        raise CastError(f"Cast control '{action}' failed for {device.name}: {exc}") from exc
+    finally:
+        if cast is not None:
+            try:
+                cast.disconnect(timeout=1)
+            except Exception:
+                pass
+
 def cast_file(
     device_identifier: str,
     path: str | Path,
@@ -247,7 +372,7 @@ def cast_file(
     except Exception as exc:
         raise CastError(f"Could not prepare media for {device.name}: {exc}") from exc
 
-    return _cast_url(
+    result = _cast_url(
         device,
         media_url,
         content_type,
@@ -255,3 +380,13 @@ def cast_file(
         autoplay=autoplay,
         loop=loop,
     )
+    PLAYBACK.remember(
+        device,
+        PlaybackRecord(
+            media_url=media_url,
+            content_type=content_type,
+            title=title,
+            loop=loop,
+        ),
+    )
+    return result
