@@ -15,6 +15,19 @@ async function fetchDevices(force = false) {
     return payload.devices || [];
 }
 
+async function sendControl(device, action) {
+    const response = await api.fetchApi("/comfycast/control", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ device, action }),
+    });
+    const payload = await response.json();
+    if (!response.ok || !payload.ok) {
+        throw new Error(payload.error || `Cast control failed (${response.status})`);
+    }
+    return payload;
+}
+
 function describeDevice(device) {
     if (device.label) return device.label;
     const model = device.model ? ` - ${device.model}` : "";
@@ -36,19 +49,51 @@ function installDevicePicker(node) {
     const status = node.addWidget(
         "text",
         "Cast status",
-        "Discovering devices…",
+        "Discovering devices...",
         () => {},
         {},
     );
     status.serialize = false;
     status.disabled = true;
 
+    let controlsBusy = false;
+    const runControl = async (action) => {
+        const device = String(deviceWidget.value || "").trim();
+        if (!device) {
+            status.value = "Select a Cast device first";
+            return;
+        }
+        if (controlsBusy) return;
+        controlsBusy = true;
+        status.value = `${action}...`;
+        node.setDirtyCanvas?.(true, true);
+        try {
+            const result = await sendControl(device, action);
+            const state = result.player_state || action;
+            status.value = `${result.name || "Cast"}: ${state}`;
+        } catch (error) {
+            status.value = `Control error: ${error.message || error}`;
+        } finally {
+            controlsBusy = false;
+            node.setDirtyCanvas?.(true, true);
+        }
+    };
+
+    for (const [label, action] of [
+        ["Start / Resume", "start"],
+        ["Pause", "pause"],
+        ["Stop", "stop"],
+        ["End Cast", "end"],
+    ]) {
+        const control = node.addWidget("button", label, null, () => runControl(action), {});
+        control.serialize = false;
+    }
+
     const refresh = async (force = false) => {
-        status.value = force ? "Refreshing devices…" : "Discovering devices…";
+        status.value = force ? "Refreshing devices..." : "Discovering devices...";
         try {
             const devices = await fetchDevices(force);
             const choices = devices.map(describeDevice);
-
             deviceWidget.options = {
                 ...(deviceWidget.options || {}),
                 values: choices,
@@ -74,14 +119,14 @@ function installDevicePicker(node) {
         node.setDirtyCanvas?.(true, true);
     };
 
-    const button = node.addWidget(
+    const refreshButton = node.addWidget(
         "button",
         "Refresh Cast devices",
         null,
         () => refresh(true),
         {},
     );
-    button.serialize = false;
+    refreshButton.serialize = false;
     refresh(false);
 }
 

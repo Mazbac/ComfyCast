@@ -76,6 +76,17 @@ Connect a native ComfyUI `VIDEO` output to **ComfyCast -> Cast Video**.
 
 Video is materialized through ComfyUI's native video API as MP4/H.264 for broad Cast compatibility. Looping uses the receiver's native single-item repeat queue, so ComfyUI does not need to stay connected to restart the video.
 
+### Playback controls
+
+Both **Cast Image** and **Cast Video** expose control buttons directly on the node:
+
+- **Start / Resume** - resume paused video, or reload the last successfully cast image/video after Stop or End Cast.
+- **Pause** - pause video playback. Still images are already held in a paused display state, so this is safe for images.
+- **Stop** - stop the current ComfyCast media while keeping the Cast receiver available.
+- **End Cast** - quit Google's Default Media Receiver on the selected display.
+
+These buttons are UI controls only and are not serialized into the workflow. They operate on the last media successfully cast to that device during the current ComfyUI session, so Start / Resume does not regenerate the workflow.
+
 ## Network behavior
 
 ComfyCast starts its own HTTP server only when media is actually cast. It listens on a random free port and advertises the computer's LAN IPv4 address to the receiver.
